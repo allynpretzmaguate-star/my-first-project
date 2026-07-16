@@ -1,0 +1,587 @@
+<?php
+/**
+ * OcrEngine
+ * Wraps the Tesseract OCR CLI binary and parses the raw extracted
+ * text into structured client fields using layout-tolerant heuristics.
+ * Also exposes per-field OCR confidence and "smart correction"
+ * suggestions for common OCR misreads.
+ */
+class OcrEngine
+{
+    public static function extractText(string $imagePath): string
+    {
+        return self::extractTextAndConfidence($imagePath)['text'];
+    }
+
+    public static function extractTextAndConfidence(string $imagePath): array
+    {
+        if (!is_file(TESSERACT_PATH) && stripos(PHP_OS, 'WIN') === 0) {
+            throw new RuntimeException(
+                'Tesseract OCR was not found at ' . TESSERACT_PATH .
+                '. Install it from https://github.com/UB-Mannheim/tesseract/wiki and/or update config/config.php.'
+            );
+        }
+
+        $enhancedImage = self::enhanceImage($imagePath);
+        $useImage = $enhancedImage !== '' ? $enhancedImage : $imagePath;
+
+        $outputBase = tempnam(sys_get_temp_dir(), 'ocr_');
+        if ($outputBase === false) {
+            throw new RuntimeException('Could not create a temporary file for OCR output.');
+        }
+        @unlink($outputBase);
+
+        $tesseract = escapeshellarg(TESSERACT_PATH);
+        $image = escapeshellarg($useImage);
+        $out = escapeshellarg($outputBase);
+
+        $cmdText = "$tesseract $image $out --psm 6 -l eng 2>&1";
+        exec($cmdText, $textOutput, $textReturnCode);
+
+        $textFile = $outputBase . '.txt';
+        if ($textReturnCode !== 0 || !is_file($textFile)) {
+            if ($enhancedImage !== '' && is_file($enhancedImage)) {
+                @unlink($enhancedImage);
+            }
+            throw new RuntimeException('OCR failed: ' . implode("\n", $textOutput));
+        }
+
+        $text = file_get_contents($textFile);
+        @unlink($textFile);
+
+        $cmdTsv = "$tesseract $image $out tsv --psm 6 -l eng 2>&1";
+        exec($cmdTsv, $tsvOutput, $tsvReturnCode);
+        $tsvFile = $outputBase . '.tsv';
+        $confidence = null;
+        $words = [];
+        if ($tsvReturnCode === 0 && is_file($tsvFile)) {
+            $confidence = self::computeAverageConfidence($tsvFile);
+            $words = self::parseTsvWords($tsvFile);
+            @unlink($tsvFile);
+        }
+
+        if ($enhancedImage !== '' && is_file($enhancedImage)) {
+            @unlink($enhancedImage);
+        }
+
+        return [
+            'text' => $text !== false ? $text : '',
+            'confidence' => $confidence,
+            'words' => $words,
+        ];
+    }
+
+    private static function enhanceImage(string $sourcePath): string
+    {
+        if (!function_exists('imagecreatefromjpeg') || !function_exists('imagefilter')) {
+            return '';
+        }
+
+        $image = self::loadImageFromFile($sourcePath);
+        if ($image === null) {
+            return '';
+        }
+
+        imagefilter($image, IMG_FILTER_GRAYSCALE);
+        imagefilter($image, IMG_FILTER_CONTRAST, -12);
+        imagefilter($image, IMG_FILTER_BRIGHTNESS, 5);
+        imagefilter($image, IMG_FILTER_SMOOTH, 1);
+
+        if (function_exists('imageconvolution')) {
+            imageconvolution($image, [
+                [-1, -1, -1],
+                [-1, 16, -1],
+                [-1, -1, -1],
+            ], 8, 0);
+        }
+
+        $tempPath = tempnam(sys_get_temp_dir(), 'ocr_img_');
+        if ($tempPath === false) {
+            imagedestroy($image);
+            return '';
+        }
+
+        $tempPath .= '.png';
+        if (!imagepng($image, $tempPath)) {
+            imagedestroy($image);
+            @unlink($tempPath);
+            return '';
+        }
+
+        imagedestroy($image);
+        return $tempPath;
+    }
+
+    private static function loadImageFromFile(string $path)
+    {
+        $info = @getimagesize($path);
+        if ($info === false) {
+            return null;
+        }
+
+        switch ($info[2]) {
+            case IMAGETYPE_JPEG:
+                return @imagecreatefromjpeg($path);
+            case IMAGETYPE_PNG:
+                return @imagecreatefrompng($path);
+            case IMAGETYPE_WEBP:
+                return @imagecreatefromwebp($path);
+            default:
+                return null;
+        }
+    }
+
+    private static function computeAverageConfidence(string $tsvFile): ?float
+    {
+        $lines = file($tsvFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+        if ($lines === false || count($lines) <= 1) {
+            return null;
+        }
+
+        $total = 0.0;
+        $count = 0;
+        foreach (array_slice($lines, 1) as $line) {
+            $parts = explode("\t", $line);
+            if (!isset($parts[10])) {
+                continue;
+            }
+            $conf = trim($parts[10]);
+            if ($conf === '' || $conf === '-1' || !is_numeric($conf)) {
+                continue;
+            }
+            $total += (float)$conf;
+            $count++;
+        }
+
+        return $count > 0 ? round($total / $count, 2) : null;
+    }
+
+    private static function parseTsvWords(string $tsvFile): array
+    {
+        $lines = file($tsvFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+        if ($lines === false || count($lines) <= 1) {
+            return [];
+        }
+
+        $words = [];
+        foreach (array_slice($lines, 1) as $line) {
+            $parts = explode("\t", $line);
+            if (count($parts) < 12) {
+                continue;
+            }
+            $level = $parts[0];
+            $conf = trim($parts[10]);
+            $text = trim($parts[11]);
+
+            if ($level !== '5' || $text === '' || $conf === '' || $conf === '-1' || !is_numeric($conf)) {
+                continue;
+            }
+
+            $words[] = ['text' => $text, 'conf' => (float)$conf];
+        }
+
+        return $words;
+    }
+
+    public static function parseFields(string $rawText): array
+    {
+        $lines = array_values(array_filter(array_map('trim', explode("\n", $rawText)), fn($l) => $l !== ''));
+        $fullText = implode(' ', $lines);
+
+        $fields = [
+            'first_name'            => '',
+            'middle_name'           => '',
+            'last_name'             => '',
+            'suffix'                => '',
+            'region'                => '',
+            'province'              => '',
+            'city'                  => '',
+            'barangay'              => '',
+            'residence'             => '',
+            'street'                => '',
+            'birth_date'            => '',
+            'birth_place'           => '',
+            'sex'                   => '',
+            'civil_status'          => '',
+            'religion'              => '',
+            'address'               => '',
+            'contact_number'        => '',
+            'email'                 => '',
+            'fb_messenger_name'     => '',
+            'ethnic_origin'         => '',
+            'language_spoken'       => '',
+            'osca_id_no'            => '',
+            'gsis_sss_no'           => '',
+            'tin'                   => '',
+            'philhealth_no'         => '',
+            'sc_association_id_no'  => '',
+            'other_govt_id_no'      => '',
+            'employment_business'   => '',
+            'has_pension'           => '',
+            'capability_to_travel'  => '',
+            'id_number'             => '',
+            'id_type'               => '',
+        ];
+
+        self::detectName($lines, $fields);
+        self::detectBirthDate($lines, $fullText, $fields);
+        self::detectSex($lines, $fullText, $fields);
+        self::detectAddress($lines, $fields);
+        self::detectIdNumber($fullText, $fields);
+        self::detectIdType($fullText, $fields);
+
+        $labelMap = [
+            'last_name'            => ['lastname', 'last name', 'apelyido'],
+            'first_name'           => ['firstname', 'first name', 'pangalan'],
+            'middle_name'          => ['middlename', 'middle name', 'gitnang pangalan'],
+            'suffix'                => ['extension'],
+            'region'                => ['region'],
+            'province'              => ['province'],
+            'city'                  => ['city', 'city/municipality', 'municipality'],
+            'barangay'              => ['barangay'],
+            'residence'             => ['residence', 'house no', 'block/lot'],
+            'street'                => ['street', 'zone/purok/sitio', 'purok'],
+            'birth_place'           => ['birth place', 'birthplace'],
+            'civil_status'          => ['marital status'],
+            'religion'              => ['religion'],
+            'contact_number'        => ['contact number'],
+            'email'                 => ['email address', 'email'],
+            'fb_messenger_name'     => ['fb messenger name', 'messenger name'],
+            'ethnic_origin'         => ['ethnic origin'],
+            'language_spoken'       => ['language spoken'],
+            'osca_id_no'            => ['osca id no', 'osca id'],
+            'gsis_sss_no'           => ['gsis/sss no', 'gsis sss no'],
+            'tin'                   => ['tin'],
+            'philhealth_no'         => ['philhealth no'],
+            'sc_association_id_no'  => ['sc association id no'],
+            'other_govt_id_no'      => ["other gov't id no", 'other govt id no'],
+            'employment_business'   => ['employment / business', 'employment/business'],
+            'has_pension'           => ['has pension'],
+            'capability_to_travel'  => ['capability to travel'],
+        ];
+
+        foreach ($labelMap as $fieldKey => $labelVariants) {
+            if ($fields[$fieldKey] !== '') {
+                continue;
+            }
+            $value = self::findLabeledValue($lines, $labelVariants);
+            if ($value !== null) {
+                $fields[$fieldKey] = $value;
+            }
+        }
+
+        if ($fields['birth_date'] === '') {
+            foreach ($lines as $i => $line) {
+                if (preg_match('/month\s*\/\s*date\s*\/\s*year/i', $line) && isset($lines[$i + 1])) {
+                    if (preg_match('/(\d{1,2})\s*\/\s*(\d{1,2})\s*\/\s*(\d{4})/', $lines[$i + 1], $m)) {
+                        $fields['birth_date'] = self::normalizeDate("{$m[1]}/{$m[2]}/{$m[3]}");
+                    }
+                }
+            }
+        }
+
+        return $fields;
+    }
+
+    public static function computeFieldConfidence(array $fields, array $words): array
+    {
+        $confidence = [];
+        $usedIndices = [];
+
+        foreach ($fields as $key => $value) {
+            if (!is_string($value) || trim($value) === '') {
+                continue;
+            }
+
+            $tokens = preg_split('/\s+/', trim($value));
+            $matchedConfs = [];
+
+            foreach ($tokens as $token) {
+                $normToken = strtolower(preg_replace('/[^a-z0-9]/i', '', $token));
+                if ($normToken === '') {
+                    continue;
+                }
+
+                foreach ($words as $i => $w) {
+                    if (in_array($i, $usedIndices, true)) {
+                        continue;
+                    }
+                    $normWord = strtolower(preg_replace('/[^a-z0-9]/i', '', $w['text']));
+                    if ($normWord === '') {
+                        continue;
+                    }
+                    if ($normWord === $normToken || (strlen($normToken) > 3 && str_contains($normWord, $normToken))) {
+                        $matchedConfs[] = $w['conf'];
+                        $usedIndices[] = $i;
+                        break;
+                    }
+                }
+            }
+
+            if (!empty($matchedConfs)) {
+                $confidence[$key] = round(array_sum($matchedConfs) / count($matchedConfs), 1);
+            }
+        }
+
+        return $confidence;
+    }
+
+    public static function suggestCorrections(array $fields): array
+    {
+        $suggestions = [];
+        foreach ($fields as $key => $value) {
+            if (!is_string($value) || trim($value) === '') {
+                continue;
+            }
+            $suggested = self::suggestFieldCorrection($key, $value);
+            if ($suggested !== null) {
+                $suggestions[$key] = $suggested;
+            }
+        }
+        return $suggestions;
+    }
+
+    private static function suggestFieldCorrection(string $key, string $value): ?string
+    {
+        // Expanded to also cover Business Card / Receipt / Invoice fields,
+        // so smart-correction suggestions aren't limited to the original
+        // ID-card-style fields.
+        $letterFields = [
+            'first_name', 'middle_name', 'last_name', 'region', 'province', 'city',
+            'barangay', 'residence', 'street', 'birth_place', 'religion', 'ethnic_origin',
+            'language_spoken', 'employment_business', 'fb_messenger_name', 'nationality',
+            'father_name', 'mother_name', 'school', 'course',
+            'full_name', 'company', 'position', 'store_name', 'company_name', 'customer_name',
+        ];
+        $digitFields = [
+            'contact_number', 'tin', 'gsis_sss_no', 'philhealth_no',
+            'osca_id_no', 'sc_association_id_no', 'other_govt_id_no', 'id_number',
+            'phone_number', 'receipt_number', 'invoice_number', 'total_amount', 'tax_amount',
+        ];
+
+        $suggested = $value;
+
+        if (in_array($key, $letterFields, true)) {
+            $letterCount = preg_match_all('/[A-Za-z]/', $value);
+            $digitCount = preg_match_all('/[0-9]/', $value);
+
+            if ($letterCount > 0 && $digitCount > 0 && $letterCount >= $digitCount) {
+                $map = ['0' => 'O', '1' => 'I', '5' => 'S', '8' => 'B', '6' => 'G'];
+                $suggested = strtr($suggested, $map);
+            }
+
+            if ($suggested === strtoupper($suggested) || $suggested === strtolower($suggested)) {
+                $titled = ucwords(strtolower($suggested));
+                if ($titled !== $suggested) {
+                    $suggested = $titled;
+                }
+            }
+        } elseif (in_array($key, $digitFields, true)) {
+            $letterMap = ['O' => '0', 'o' => '0', 'I' => '1', 'l' => '1', 'S' => '5', 's' => '5', 'B' => '8', 'G' => '6', 'Z' => '2', 'z' => '2'];
+            $hasLetters = (bool)preg_match('/[A-Za-z]/', $value);
+            if ($hasLetters) {
+                $suggested = strtr($suggested, $letterMap);
+            }
+
+            if ($key === 'contact_number' || $key === 'phone_number') {
+                $digitsOnly = preg_replace('/\D/', '', $suggested);
+                if (strlen($digitsOnly) === 11 && str_starts_with($digitsOnly, '09')) {
+                    $formatted = substr($digitsOnly, 0, 4) . '-' . substr($digitsOnly, 4, 3) . '-' . substr($digitsOnly, 7, 4);
+                    if ($formatted !== $suggested) {
+                        $suggested = $formatted;
+                    }
+                } elseif (strlen($digitsOnly) === 12 && str_starts_with($digitsOnly, '639')) {
+                    $local = '0' . substr($digitsOnly, 2);
+                    $suggested = substr($local, 0, 4) . '-' . substr($local, 4, 3) . '-' . substr($local, 7, 4);
+                }
+            }
+        }
+
+        return $suggested !== $value ? $suggested : null;
+    }
+
+    private static function findLabeledValue(array $lines, array $labelVariants): ?string
+    {
+        foreach ($lines as $i => $line) {
+            $normalized = strtolower(preg_replace('/[^a-z0-9\/\'\s]/i', '', $line));
+            foreach ($labelVariants as $variant) {
+                if (str_contains($normalized, $variant)) {
+                    if (preg_match('/[:\-]\s*(.+)/', $line, $m) && trim($m[1]) !== '') {
+                        return trim($m[1]);
+                    }
+                    if (isset($lines[$i + 1]) && !self::isLikelyLabel($lines[$i + 1])) {
+                        return trim($lines[$i + 1]);
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    private static function isLikelyLabel(string $line): bool
+    {
+        return (bool)preg_match('/^\d{1,2}[a-z]?\.\s/i', trim($line))
+            || (bool)preg_match('/^[A-Z\s\.\/]{6,}$/', trim($line));
+    }
+
+    private static function detectName(array $lines, array &$fields): void
+    {
+        foreach ($lines as $line) {
+            if (preg_match('/last\s*name\s*[:\-]\s*(.+)/i', $line, $m)) {
+                $fields['last_name'] = self::cleanName($m[1]);
+            }
+            if (preg_match('/first\s*name\s*[:\-]\s*(.+)/i', $line, $m)) {
+                $fields['first_name'] = self::cleanName($m[1]);
+            }
+            if (preg_match('/middle\s*name\s*[:\-]\s*(.+)/i', $line, $m)) {
+                $fields['middle_name'] = self::cleanName($m[1]);
+            }
+        }
+        if ($fields['first_name'] !== '' || $fields['last_name'] !== '') {
+            return;
+        }
+
+        foreach ($lines as $line) {
+            if (preg_match('/^([A-Z\'\-]{2,})\s*,\s*([A-Z\'\- ]{2,})$/', $line, $m)) {
+                $fields['last_name'] = self::cleanName($m[1]);
+                $nameParts = preg_split('/\s+/', trim($m[2]));
+                $fields['first_name'] = self::cleanName($nameParts[0] ?? '');
+                if (count($nameParts) > 1) {
+                    $fields['middle_name'] = self::cleanName(implode(' ', array_slice($nameParts, 1)));
+                }
+                return;
+            }
+        }
+
+        foreach ($lines as $line) {
+            if (preg_match('/^name\s*[:\-]\s*(.+)/i', $line, $m)) {
+                $raw = trim($m[1]);
+                $parts = preg_split('/\s+/', $raw);
+                $parts = array_values(array_filter($parts, fn($p) => $p !== ''));
+
+                if (count($parts) >= 3) {
+                    $fields['first_name'] = self::cleanName($parts[0]);
+                    $fields['last_name']  = self::cleanName(end($parts));
+                    $middle = array_slice($parts, 1, count($parts) - 2);
+                    $fields['middle_name'] = self::cleanName(implode(' ', $middle));
+                } elseif (count($parts) === 2) {
+                    $fields['first_name'] = self::cleanName($parts[0]);
+                    $fields['last_name']  = self::cleanName($parts[1]);
+                } elseif (count($parts) === 1) {
+                    $fields['first_name'] = self::cleanName($parts[0]);
+                }
+                return;
+            }
+        }
+    }
+
+    private static function detectBirthDate(array $lines, string $fullText, array &$fields): void
+    {
+        foreach ($lines as $line) {
+            if (preg_match('/(date\s*of\s*birth|birth\s*date|dob)/i', $line)) {
+                if (preg_match('/\b(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})\b/', $line, $m)) {
+                    $fields['birth_date'] = self::normalizeDate($m[1]);
+                    return;
+                }
+                if (preg_match('/\b((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2},?\s*\d{4})\b/i', $line, $m)) {
+                    $fields['birth_date'] = self::normalizeDate($m[1]);
+                    return;
+                }
+            }
+        }
+
+        if (preg_match('/\b((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2},?\s*\d{4})\b/i', $fullText, $m)) {
+            $fields['birth_date'] = self::normalizeDate($m[1]);
+        } elseif (preg_match('/\b(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})\b/', $fullText, $m)) {
+            $fields['birth_date'] = self::normalizeDate($m[1]);
+        }
+    }
+
+    private static function detectSex(array $lines, string $fullText, array &$fields): void
+    {
+        if (preg_match('/\bsex\s*[:\-]?\s*(male|female|M|F)\b/i', $fullText, $m)) {
+            $fields['sex'] = strtoupper($m[1][0]) === 'M' ? 'Male' : 'Female';
+            return;
+        }
+
+        foreach ($lines as $i => $line) {
+            if (preg_match('/^sex/i', trim($line)) && isset($lines[$i + 1])) {
+                if (preg_match('/^(M|F|Male|Female)$/i', trim($lines[$i + 1]), $m)) {
+                    $fields['sex'] = strtoupper($m[1][0]) === 'M' ? 'Male' : 'Female';
+                    return;
+                }
+            }
+        }
+    }
+
+    private static function detectAddress(array $lines, array &$fields): void
+    {
+        foreach ($lines as $i => $line) {
+            if (preg_match('/^address\s*[:\-]\s*(.+)/i', $line, $m)) {
+                $address = trim($m[1]);
+                $j = $i + 1;
+                while (isset($lines[$j]) && !self::looksLikeNewLabel($lines[$j]) && strlen($address) < 160) {
+                    $address .= ' ' . trim($lines[$j]);
+                    $j++;
+                }
+                $fields['address'] = trim(preg_replace('/\s+/', ' ', $address));
+                return;
+            }
+        }
+    }
+
+    private static function looksLikeNewLabel(string $line): bool
+    {
+        return (bool)preg_match('/^(name|address|sex|date of birth|birth\s*date|dob|id\s*(type|number)|control\s*no)/i', trim($line));
+    }
+
+    private static function detectIdNumber(string $fullText, array &$fields): void
+    {
+        if (preg_match('/(id\s*number|pcn|control\s*no\.?)\s*[:\-]?\s*([0-9][0-9\-\s]{5,20}[0-9])/i', $fullText, $m)) {
+            $fields['id_number'] = trim(preg_replace('/\s+/', ' ', $m[2]));
+            return;
+        }
+        if (preg_match('/\b(\d{4}[\-\s]?\d{4}[\-\s]?\d{4}[\-\s]?\d{4})\b/', $fullText, $m)) {
+            $fields['id_number'] = trim($m[1]);
+            return;
+        }
+        if (preg_match('/\b(\d{4}[\-\s]?\d{4,7}[\-\s]?\d{0,4})\b/', $fullText, $m)) {
+            $fields['id_number'] = trim($m[1]);
+        }
+    }
+
+    private static function detectIdType(string $fullText, array &$fields): void
+    {
+        $idTypeMap = [
+            'philippine identification' => 'National ID (PhilSys)',
+            'philsys'                   => 'National ID (PhilSys)',
+            'senior citizen'            => 'Senior Citizen ID (OSCA)',
+            'office for senior citizens' => 'Senior Citizen ID (OSCA)',
+            'driver'                    => "Driver's License",
+            'passport'                  => 'Passport',
+            'sss'                       => 'SSS ID',
+            'philhealth'                => 'PhilHealth ID',
+            'unified multi-purpose'     => 'UMID',
+            'voter'                     => "Voter's ID",
+            'pwd'                       => 'PWD ID',
+        ];
+        foreach ($idTypeMap as $keyword => $label) {
+            if (stripos($fullText, $keyword) !== false) {
+                $fields['id_type'] = $label;
+                return;
+            }
+        }
+    }
+
+    private static function cleanName(string $name): string
+    {
+        $name = preg_replace('/[^A-Za-z\'\-\. ]/', '', $name);
+        return trim(ucwords(strtolower(trim($name))));
+    }
+
+    private static function normalizeDate(string $raw): string
+    {
+        $ts = strtotime($raw);
+        return $ts !== false ? date('Y-m-d', $ts) : '';
+    }
+}
