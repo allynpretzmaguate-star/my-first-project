@@ -1,5 +1,6 @@
 <?php
 require_once dirname(__DIR__) . '/config/config.php';
+require_once dirname(__DIR__) . '/includes/ocr.php';
 require_once dirname(__DIR__) . '/includes/DocumentClassifier.php';
 require_once dirname(__DIR__) . '/includes/DocumentFieldExtractor.php';
 require_login();

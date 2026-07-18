@@ -227,13 +227,13 @@ class OcrEngine
         self::detectBirthDate($lines, $fullText, $fields);
         self::detectSex($lines, $fullText, $fields);
         self::detectAddress($lines, $fields);
-        self::detectIdNumber($fullText, $fields);
+        self::detectIdNumber($fullText, $fields, $lines);
         self::detectIdType($fullText, $fields);
 
         $labelMap = [
             'last_name'            => ['lastname', 'last name', 'apelyido'],
-            'first_name'           => ['firstname', 'first name', 'pangalan'],
-            'middle_name'          => ['middlename', 'middle name', 'gitnang pangalan'],
+            'first_name'           => ['firstname', 'first name', 'pangalan', 'given name', 'given names'],
+            'middle_name'          => ['middlename', 'middle name', 'gitnang pangalan', 'gitnang apelyido'],
             'suffix'                => ['extension'],
             'region'                => ['region'],
             'province'              => ['province'],
@@ -241,7 +241,7 @@ class OcrEngine
             'barangay'              => ['barangay'],
             'residence'             => ['residence', 'house no', 'block/lot'],
             'street'                => ['street', 'zone/purok/sitio', 'purok'],
-            'birth_place'           => ['birth place', 'birthplace'],
+            'birth_place'           => ['birth place', 'birthplace', 'lugar ng kapanganakan'],
             'civil_status'          => ['marital status'],
             'religion'              => ['religion'],
             'contact_number'        => ['contact number'],
@@ -266,7 +266,9 @@ class OcrEngine
             }
             $value = self::findLabeledValue($lines, $labelVariants);
             if ($value !== null) {
-                $fields[$fieldKey] = $value;
+                $fields[$fieldKey] = ($fieldKey === 'first_name' || $fieldKey === 'middle_name' || $fieldKey === 'last_name')
+                    ? self::cleanName($value)
+                    : $value;
             }
         }
 
@@ -400,6 +402,15 @@ class OcrEngine
         return $suggested !== $value ? $suggested : null;
     }
 
+    /**
+     * Finds a labeled value where the value is either:
+     *   - on the same line after a colon/dash ("Label: value"), or
+     *   - on the next line entirely (common on ID cards, e.g.
+     *     "APELYIDO/LAST NAME" on one line, "DELA CRUZ" on the next).
+     * Label matching no longer requires the label to be at the start of
+     * the line, since cards often prefix it with a bilingual translation
+     * ("TIRAHAN/ADDRESS", "GITNANG APELYIDO/MIDDLE NAME", etc.).
+     */
     private static function findLabeledValue(array $lines, array $labelVariants): ?string
     {
         foreach ($lines as $i => $line) {
@@ -475,10 +486,16 @@ class OcrEngine
         }
     }
 
+    /**
+     * Detects date of birth. Checks the label line itself first
+     * ("Date of Birth: 10/04/1987"), then falls back to the *next* line,
+     * since many ID layouts (PhilSys National ID included) put the label
+     * on its own line and the date directly underneath it.
+     */
     private static function detectBirthDate(array $lines, string $fullText, array &$fields): void
     {
-        foreach ($lines as $line) {
-            if (preg_match('/(date\s*of\s*birth|birth\s*date|dob)/i', $line)) {
+        foreach ($lines as $i => $line) {
+            if (preg_match('/(date\s*of\s*birth|birth\s*date|dob|petsa\s*ng\s*kapanganakan)/i', $line)) {
                 if (preg_match('/\b(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})\b/', $line, $m)) {
                     $fields['birth_date'] = self::normalizeDate($m[1]);
                     return;
@@ -486,6 +503,20 @@ class OcrEngine
                 if (preg_match('/\b((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2},?\s*\d{4})\b/i', $line, $m)) {
                     $fields['birth_date'] = self::normalizeDate($m[1]);
                     return;
+                }
+                // Fall back to the next line — the value is often printed
+                // directly below the (possibly bilingual) label instead of
+                // beside it.
+                if (isset($lines[$i + 1])) {
+                    $next = $lines[$i + 1];
+                    if (preg_match('/\b(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})\b/', $next, $m)) {
+                        $fields['birth_date'] = self::normalizeDate($m[1]);
+                        return;
+                    }
+                    if (preg_match('/\b((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2},?\s*\d{4})\b/i', $next, $m)) {
+                        $fields['birth_date'] = self::normalizeDate($m[1]);
+                        return;
+                    }
                 }
             }
         }
@@ -514,16 +545,34 @@ class OcrEngine
         }
     }
 
+    /**
+     * Detects the address. The label may appear bilingually
+     * ("TIRAHAN/ADDRESS") rather than starting the line with "Address",
+     * so we now match "address" anywhere in the line instead of requiring
+     * it at the start. The value may be on the same line (after a colon
+     * or dash) or spill across the following line(s).
+     */
     private static function detectAddress(array $lines, array &$fields): void
     {
         foreach ($lines as $i => $line) {
-            if (preg_match('/^address\s*[:\-]\s*(.+)/i', $line, $m)) {
+            if (!preg_match('/\baddress\b/i', $line)) {
+                continue;
+            }
+
+            $address = '';
+            if (preg_match('/[:\-]\s*(.+)/', $line, $m) && trim($m[1]) !== '') {
                 $address = trim($m[1]);
                 $j = $i + 1;
-                while (isset($lines[$j]) && !self::looksLikeNewLabel($lines[$j]) && strlen($address) < 160) {
-                    $address .= ' ' . trim($lines[$j]);
-                    $j++;
-                }
+            } else {
+                $j = $i + 1;
+            }
+
+            while (isset($lines[$j]) && !self::looksLikeNewLabel($lines[$j]) && strlen($address) < 160) {
+                $address .= ($address === '' ? '' : ' ') . trim($lines[$j]);
+                $j++;
+            }
+
+            if ($address !== '') {
                 $fields['address'] = trim(preg_replace('/\s+/', ' ', $address));
                 return;
             }
@@ -532,15 +581,38 @@ class OcrEngine
 
     private static function looksLikeNewLabel(string $line): bool
     {
-        return (bool)preg_match('/^(name|address|sex|date of birth|birth\s*date|dob|id\s*(type|number)|control\s*no)/i', trim($line));
+        return (bool)preg_match('/^(name|address|sex|date of birth|birth\s*date|dob|id\s*(type|number)|control\s*no|digital\s*id)/i', trim($line));
     }
 
-    private static function detectIdNumber(string $fullText, array &$fields): void
+    /**
+     * Looks for the ID number in priority order:
+     *   1. An explicit label like "ID Number", "PCN", "Control No.", or
+     *      "Digital ID Number" (PhilSys cards use this exact label for a
+     *      short alphanumeric code, e.g. "AYM6774").
+     *   2. The PhilSys PSN/PCN dashed format: 4 groups of 4 digits
+     *      (e.g. 5413-5073-8453-1285).
+     *   3. A looser fallback digit-grouping pattern.
+     */
+    private static function detectIdNumber(string $fullText, array &$fields, array $lines = []): void
     {
+        foreach ($lines as $i => $line) {
+            if (preg_match('/digital\s*id\s*numb/i', $line)) {
+                if (preg_match('/[:\-]\s*([A-Z0-9]{4,})/i', $line, $m)) {
+                    $fields['id_number'] = trim($m[1]);
+                    return;
+                }
+                if (isset($lines[$i + 1]) && preg_match('/^[A-Z0-9]{4,}$/i', trim($lines[$i + 1]))) {
+                    $fields['id_number'] = trim($lines[$i + 1]);
+                    return;
+                }
+            }
+        }
+
         if (preg_match('/(id\s*number|pcn|control\s*no\.?)\s*[:\-]?\s*([0-9][0-9\-\s]{5,20}[0-9])/i', $fullText, $m)) {
             $fields['id_number'] = trim(preg_replace('/\s+/', ' ', $m[2]));
             return;
         }
+        // PhilSys PSN / PCN format: 4 groups of 4 digits (e.g. 5413-5073-8453-1285)
         if (preg_match('/\b(\d{4}[\-\s]?\d{4}[\-\s]?\d{4}[\-\s]?\d{4})\b/', $fullText, $m)) {
             $fields['id_number'] = trim($m[1]);
             return;
@@ -555,6 +627,7 @@ class OcrEngine
         $idTypeMap = [
             'philippine identification' => 'National ID (PhilSys)',
             'philsys'                   => 'National ID (PhilSys)',
+            'pambansang pagkakakilanlan' => 'National ID (PhilSys)',
             'senior citizen'            => 'Senior Citizen ID (OSCA)',
             'office for senior citizens' => 'Senior Citizen ID (OSCA)',
             'driver'                    => "Driver's License",

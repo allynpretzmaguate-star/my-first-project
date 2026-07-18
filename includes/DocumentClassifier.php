@@ -21,7 +21,7 @@ class DocumentClassifier
             'keywords' => [
                 'philsys' => 35, 'philippine identification card' => 35,
                 'pambansang pagkakakilanlan' => 30, 'republika ng pilipinas' => 15,
-                'psn' => 10, 'pcn' => 10,
+                'psn' => 10, 'pcn' => 10, 'digital id' => 15,
             ],
         ],
         'drivers_license' => [
@@ -144,10 +144,14 @@ class DocumentClassifier
     public static function primaryFieldsForClientForm(string $type): array
     {
         return match ($type) {
+            // Matches the actual printed fields on a PhilSys National ID:
+            // Apelyido/Last Name, Mga Pangalan/Given Names,
+            // Gitnang Apelyido/Middle Name, Petsa ng Kapanganakan/Date of
+            // Birth, Tirahan/Address, and the Digital ID Number (stored in
+            // id_number, with id_type auto-filled as "National ID (PhilSys)").
             'national_id' => [
-                'first_name', 'middle_name', 'last_name', 'suffix',
-                'region', 'province', 'city', 'barangay', 'residence', 'street', 'address',
-                'birth_date', 'sex', 'civil_status', 'nationality', 'id_type', 'id_number',
+                'first_name', 'middle_name', 'last_name',
+                'birth_date', 'address', 'id_type', 'id_number',
             ],
             'drivers_license' => [
                 'first_name', 'middle_name', 'last_name', 'suffix',
