@@ -184,18 +184,32 @@ include dirname(__DIR__) . '/includes/header.php';
     <?php if (!$docType): ?>
         <p class="text-muted">Select a document type above, or use <a href="scan.php">Scan Document</a> to detect it automatically.</p>
     <?php else: ?>
-        <form method="POST" action="add.php" id="addClientForm">
-            <?= csrf_field() ?>
-            <input type="hidden" name="doc_type" value="<?= h($docType) ?>">
-            <input type="hidden" name="from_ocr_image" value="<?= h($fromOcrImage) ?>">
+        <div class="<?= $fromOcrImage !== '' ? 'detail-grid' : '' ?>">
+            <div>
+                <form method="POST" action="add.php" id="addClientForm">
+                    <?= csrf_field() ?>
+                    <input type="hidden" name="doc_type" value="<?= h($docType) ?>">
+                    <input type="hidden" name="from_ocr_image" value="<?= h($fromOcrImage) ?>">
 
-            <?php render_dynamic_form_fields($docType, $values, $fieldMeta); ?>
+                    <?php render_dynamic_form_fields($docType, $values, $fieldMeta); ?>
 
-            <div class="form-actions">
-                <button type="submit" class="btn btn-primary">Save Client Record</button>
-                <a href="<?= BASE_URL ?>clients/list.php" class="btn btn-outline">Cancel</a>
+                    <div class="form-actions">
+                        <button type="submit" class="btn btn-primary">Save Client Record</button>
+                        <a href="<?= BASE_URL ?>clients/list.php" class="btn btn-outline">Cancel</a>
+                    </div>
+                </form>
             </div>
-        </form>
+
+            <?php if ($fromOcrImage !== '' && is_file(UPLOAD_DIR . basename($fromOcrImage))): ?>
+                <div>
+                    <h4>Scanned Document</h4>
+                    <img class="document-preview lightbox-trigger"
+                         src="<?= BASE_URL ?>uploads/documents/<?= h(basename($fromOcrImage)) ?>"
+                         alt="Scanned document preview">
+                    <p class="text-muted small" style="margin-top:6px">Compare the extracted fields against the original. Click the image to enlarge.</p>
+                </div>
+            <?php endif; ?>
+        </div>
     <?php endif; ?>
 </div>
 
