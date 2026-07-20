@@ -16,10 +16,6 @@ if (!$client) {
     redirect('clients/list.php');
 }
 
-// --- Document-type-aware field display -------------------------------------
-// Same idea as clients/add.php and clients/view.php: if this record came
-// from a classifiable person-identity scan, only show the fields typical
-// for that document type by default, with a toggle to reveal the rest.
 $scanStmt = $db->prepare('SELECT * FROM ocr_scans WHERE client_id = ? ORDER BY created_at DESC LIMIT 1');
 $scanStmt->execute([$id]);
 $scan = $scanStmt->fetch();
@@ -29,8 +25,6 @@ $isPersonDoc = $docType && DocumentClassifier::isPersonType($docType);
 $primaryFields = $isPersonDoc ? DocumentClassifier::primaryFieldsForClientForm($docType) : [];
 $docLabel = $docType ? (DocumentClassifier::allTypes()[$docType] ?? null) : null;
 
-/** Returns the class string for a form-group div — hides fields that aren't
- *  typical for the detected document type until "Show All Fields" is toggled. */
 function fgclass(string $key, array $primaryFields, string $extra = ''): string
 {
     $classes = ['form-group'];
@@ -42,20 +36,21 @@ function fgclass(string $key, array $primaryFields, string $extra = ''): string
     }
     return implode(' ', $classes);
 }
-// -----------------------------------------------------------------------------
 
 $errors = [];
-$values = $client; // start with existing DB values, overwritten on POST
+$values = $client;
 
 $editableFields = [
     'first_name', 'middle_name', 'last_name', 'suffix',
     'region', 'province', 'city', 'barangay', 'residence', 'street',
-    'birth_date', 'birth_place', 'sex', 'civil_status', 'religion',
+    'birth_date', 'time_of_birth', 'birth_place', 'sex', 'blood_type', 'civil_status', 'religion',
     'nationality', 'address', 'contact_number', 'email', 'fb_messenger_name',
     'ethnic_origin', 'language_spoken', 'osca_id_no', 'gsis_sss_no', 'tin',
     'philhealth_no', 'sc_association_id_no', 'other_govt_id_no',
     'employment_business', 'has_pension', 'capability_to_travel',
-    'id_type', 'id_number', 'notes', 'status',
+    'father_name', 'mother_name', 'date_of_registration',
+    'id_type', 'id_number', 'id_issue_date', 'id_expiration_date', 'issuing_authority', 'restrictions',
+    'notes', 'status',
 ];
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
@@ -86,14 +81,26 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if (!in_array($values['status'], ['active', 'archived'], true)) {
         $errors[] = 'Invalid status value.';
     }
+
     $birthDate = null;
     if ($values['birth_date'] !== '') {
         $ts = strtotime($values['birth_date']);
-        if ($ts === false) {
-            $errors[] = 'Invalid birth date.';
-        } else {
-            $birthDate = date('Y-m-d', $ts);
-        }
+        if ($ts === false) { $errors[] = 'Invalid birth date.'; } else { $birthDate = date('Y-m-d', $ts); }
+    }
+    $dateOfRegistration = null;
+    if ($values['date_of_registration'] !== '') {
+        $ts = strtotime($values['date_of_registration']);
+        if ($ts === false) { $errors[] = 'Invalid date of registration.'; } else { $dateOfRegistration = date('Y-m-d', $ts); }
+    }
+    $idIssueDate = null;
+    if ($values['id_issue_date'] !== '') {
+        $ts = strtotime($values['id_issue_date']);
+        if ($ts === false) { $errors[] = 'Invalid ID issue date.'; } else { $idIssueDate = date('Y-m-d', $ts); }
+    }
+    $idExpirationDate = null;
+    if ($values['id_expiration_date'] !== '') {
+        $ts = strtotime($values['id_expiration_date']);
+        if ($ts === false) { $errors[] = 'Invalid ID expiration date.'; } else { $idExpirationDate = date('Y-m-d', $ts); }
     }
 
     if (empty($errors)) {
@@ -102,12 +109,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'UPDATE clients SET
                     first_name = ?, middle_name = ?, last_name = ?, suffix = ?,
                     region = ?, province = ?, city = ?, barangay = ?, residence = ?, street = ?,
-                    birth_date = ?, birth_place = ?, sex = ?, civil_status = ?, religion = ?,
+                    birth_date = ?, time_of_birth = ?, birth_place = ?, sex = ?, blood_type = ?, civil_status = ?, religion = ?,
                     nationality = ?, address = ?, contact_number = ?, email = ?, fb_messenger_name = ?,
                     ethnic_origin = ?, language_spoken = ?, osca_id_no = ?, gsis_sss_no = ?, tin = ?,
                     philhealth_no = ?, sc_association_id_no = ?, other_govt_id_no = ?,
                     employment_business = ?, has_pension = ?, capability_to_travel = ?,
-                    id_type = ?, id_number = ?, notes = ?, status = ?, updated_by = ?
+                    father_name = ?, mother_name = ?, date_of_registration = ?,
+                    id_type = ?, id_number = ?, id_issue_date = ?, id_expiration_date = ?, issuing_authority = ?, restrictions = ?,
+                    notes = ?, status = ?, updated_by = ?
                  WHERE id = ?'
             );
             $stmt->execute([
@@ -122,8 +131,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $values['residence'] ?: null,
                 $values['street'] ?: null,
                 $birthDate,
+                $values['time_of_birth'] ?: null,
                 $values['birth_place'] ?: null,
                 $values['sex'] ?: null,
+                $values['blood_type'] ?: null,
                 $values['civil_status'] ?: null,
                 $values['religion'] ?: null,
                 $values['nationality'] ?: null,
@@ -142,8 +153,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $values['employment_business'] ?: null,
                 $values['has_pension'] ?: null,
                 $values['capability_to_travel'] ?: null,
+                $values['father_name'] ?: null,
+                $values['mother_name'] ?: null,
+                $dateOfRegistration,
                 $values['id_type'] ?: null,
                 $values['id_number'] ?: null,
+                $idIssueDate,
+                $idExpirationDate,
+                $values['issuing_authority'] ?: null,
+                $values['restrictions'] ?: null,
                 $values['notes'] ?: null,
                 $values['status'],
                 $_SESSION['user_id'],
@@ -160,12 +178,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 }
 
-// Normalize birth_date for the <input type="date"> value on both the
-// initial GET load (raw DB value) and a failed POST (already Y-m-d or '').
 $birthDateValue = '';
 if (!empty($values['birth_date'])) {
     $ts = strtotime($values['birth_date']);
     $birthDateValue = $ts !== false ? date('Y-m-d', $ts) : '';
+}
+$dateOfRegValue = '';
+if (!empty($values['date_of_registration'])) {
+    $ts = strtotime($values['date_of_registration']);
+    $dateOfRegValue = $ts !== false ? date('Y-m-d', $ts) : '';
+}
+$idIssueDateValue = '';
+if (!empty($values['id_issue_date'])) {
+    $ts = strtotime($values['id_issue_date']);
+    $idIssueDateValue = $ts !== false ? date('Y-m-d', $ts) : '';
+}
+$idExpirationDateValue = '';
+if (!empty($values['id_expiration_date'])) {
+    $ts = strtotime($values['id_expiration_date']);
+    $idExpirationDateValue = $ts !== false ? date('Y-m-d', $ts) : '';
 }
 
 $pageTitle = 'Edit Client';
@@ -257,6 +288,10 @@ include dirname(__DIR__) . '/includes/header.php';
                 <label for="birth_date">Birth Date</label>
                 <input type="date" name="birth_date" id="birth_date" value="<?= h($birthDateValue) ?>">
             </div>
+            <div class="<?= fgclass('time_of_birth', $primaryFields) ?>">
+                <label for="time_of_birth">Time of Birth</label>
+                <input type="text" name="time_of_birth" id="time_of_birth" placeholder="e.g. 3:45 PM" value="<?= h($values['time_of_birth']) ?>">
+            </div>
             <div class="<?= fgclass('birth_place', $primaryFields) ?>">
                 <label for="birth_place">Birth Place</label>
                 <input type="text" name="birth_place" id="birth_place" value="<?= h($values['birth_place']) ?>">
@@ -283,9 +318,29 @@ include dirname(__DIR__) . '/includes/header.php';
                     <option value="Other" <?= $values['sex'] === 'Other' ? 'selected' : '' ?>>Other</option>
                 </select>
             </div>
+            <div class="<?= fgclass('blood_type', $primaryFields) ?>">
+                <label for="blood_type">Blood Type</label>
+                <input type="text" name="blood_type" id="blood_type" placeholder="e.g. O+" value="<?= h($values['blood_type']) ?>">
+            </div>
             <div class="<?= fgclass('nationality', $primaryFields) ?>">
                 <label for="nationality">Nationality</label>
                 <input type="text" name="nationality" id="nationality" value="<?= h($values['nationality']) ?>">
+            </div>
+        </div>
+
+        <h4 style="margin-top:20px">Family Info (Birth Certificate)</h4>
+        <div class="form-grid">
+            <div class="<?= fgclass('father_name', $primaryFields) ?>">
+                <label for="father_name">Father's Name</label>
+                <input type="text" name="father_name" id="father_name" value="<?= h($values['father_name']) ?>">
+            </div>
+            <div class="<?= fgclass('mother_name', $primaryFields) ?>">
+                <label for="mother_name">Mother's Maiden Name</label>
+                <input type="text" name="mother_name" id="mother_name" value="<?= h($values['mother_name']) ?>">
+            </div>
+            <div class="<?= fgclass('date_of_registration', $primaryFields) ?>">
+                <label for="date_of_registration">Date of Registration</label>
+                <input type="date" name="date_of_registration" id="date_of_registration" value="<?= h($dateOfRegValue) ?>">
             </div>
         </div>
 
@@ -344,8 +399,24 @@ include dirname(__DIR__) . '/includes/header.php';
                 <input type="text" name="id_type" id="id_type" value="<?= h($values['id_type']) ?>">
             </div>
             <div class="<?= fgclass('id_number', $primaryFields) ?>">
-                <label for="id_number">ID Number (from scanned document)</label>
+                <label for="id_number">ID / License / Passport / PCN Number</label>
                 <input type="text" name="id_number" id="id_number" value="<?= h($values['id_number']) ?>">
+            </div>
+            <div class="<?= fgclass('id_issue_date', $primaryFields) ?>">
+                <label for="id_issue_date">Date of Issue</label>
+                <input type="date" name="id_issue_date" id="id_issue_date" value="<?= h($idIssueDateValue) ?>">
+            </div>
+            <div class="<?= fgclass('id_expiration_date', $primaryFields) ?>">
+                <label for="id_expiration_date">Expiration Date</label>
+                <input type="date" name="id_expiration_date" id="id_expiration_date" value="<?= h($idExpirationDateValue) ?>">
+            </div>
+            <div class="<?= fgclass('issuing_authority', $primaryFields) ?>">
+                <label for="issuing_authority">Issuing Authority</label>
+                <input type="text" name="issuing_authority" id="issuing_authority" placeholder="e.g. DFA Manila" value="<?= h($values['issuing_authority']) ?>">
+            </div>
+            <div class="<?= fgclass('restrictions', $primaryFields) ?>">
+                <label for="restrictions">Restrictions (Driver's License)</label>
+                <input type="text" name="restrictions" id="restrictions" value="<?= h($values['restrictions']) ?>">
             </div>
         </div>
 
