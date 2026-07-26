@@ -49,11 +49,43 @@ class OcrEngine
 
         $result = self::callOcrService($imagePath);
 
-        return [
+        $output = [
             'text' => $result['text'] ?? '',
             'confidence' => $result['confidence'] ?? null,
             'words' => $result['words'] ?? [],
         ];
+
+        self::logDebug($imagePath, $output);
+
+        return $output;
+    }
+
+    /**
+     * Writes the raw OCR text/words for every scan to logs/ocr_debug.log.
+     * This is a temporary debugging aid — once name/field parsing is
+     * reliable, feel free to remove calls to this method (or just stop
+     * reading the log).
+     */
+    private static function logDebug(string $imagePath, array $result): void
+    {
+        $logDir = dirname(__DIR__) . '/logs';
+        if (!is_dir($logDir)) {
+            @mkdir($logDir, 0777, true);
+        }
+        $logFile = $logDir . '/ocr_debug.log';
+
+        $entry = "==== " . date('Y-m-d H:i:s') . " ====\n";
+        $entry .= "Image: $imagePath\n";
+        $entry .= "Confidence: " . ($result['confidence'] ?? 'null') . "\n";
+        $entry .= "--- Raw text (line by line) ---\n";
+        $entry .= ($result['text'] ?? '') . "\n";
+        $entry .= "--- Words with confidence ---\n";
+        foreach (($result['words'] ?? []) as $w) {
+            $entry .= "  [{$w['conf']}%] " . $w['text'] . "\n";
+        }
+        $entry .= "\n";
+
+        @file_put_contents($logFile, $entry, FILE_APPEND);
     }
 
     /**
@@ -376,8 +408,25 @@ class OcrEngine
 
     private static function isLikelyLabel(string $line): bool
     {
-        return (bool)preg_match('/^\d{1,2}[a-z]?\.\s/i', trim($line))
-            || (bool)preg_match('/^[A-Z\s\.\/]{6,}$/', trim($line));
+        $trimmed = trim($line);
+
+        // Numbered list style label, e.g. "1. Last Name"
+        if (preg_match('/^\d{1,2}[a-z]?\.\s/i', $trimmed)) {
+            return true;
+        }
+
+        // PhilSys-style bilingual labels always contain a '/' separating the
+        // Filipino and English wording, e.g. "APELYIDO/LAST NAME",
+        // "PETSA NG KAPANGANAKAN/DATE OF BIRTH". Actual data values (names,
+        // addresses) printed in all-caps on the ID never contain a '/', so
+        // this is a much safer signal than a generic "is it all caps" check
+        // (which previously misclassified names like "ANGEL MAE" and
+        // "BUENAVENTURA" as labels and caused them to be skipped).
+        if (str_contains($trimmed, '/') && preg_match('/[A-Za-z]/', $trimmed)) {
+            return true;
+        }
+
+        return false;
     }
 
     private static function detectName(array $lines, array &$fields): void
@@ -567,8 +616,15 @@ class OcrEngine
 
     private static function cleanName(string $name): string
     {
-        $name = preg_replace('/[^A-Za-z\'\-\. ]/', '', $name);
-        return trim(ucwords(strtolower(trim($name))));
+        // \p{L} (Unicode "letter" category) keeps accented Filipino letters
+        // like Ñ/ñ, Á, É, etc. instead of deleting them the way a plain
+        // A-Za-z character class does (which was turning "PAÑOSO" into
+        // "Paoso"). The /u flag makes the regex treat the string as UTF-8.
+        $name = preg_replace('/[^\p{L}\'\-\. ]/u', '', $name);
+        $name = trim($name);
+        // mb_convert_case handles multibyte title-casing correctly (plain
+        // ucwords/strtolower can mangle UTF-8 accented characters).
+        return mb_convert_case(mb_strtolower($name, 'UTF-8'), MB_CASE_TITLE, 'UTF-8');
     }
 
     private static function normalizeDate(string $raw): string
