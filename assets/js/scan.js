@@ -7,11 +7,32 @@
         const scanButton = document.getElementById('scanButton');
         const scanStatus = document.getElementById('scanStatus');
         const extractedFormCard = document.getElementById('extractedFormCard');
+        const detectedTypeHeading = document.getElementById('detectedTypeHeading');
+        const detectedTypeSub = document.getElementById('detectedTypeSub');
+        const continueToReview = document.getElementById('continueToReview');
+        const scanAnotherBtn = document.getElementById('scanAnotherBtn');
         const csrfInput = document.querySelector('input[name="csrf_token"]');
         const csrfToken = csrfInput ? csrfInput.value : '';
         const safeStatus = scanStatus || { innerHTML: '', textContent: '' };
 
         let selectedFile = null;
+
+        function resetScanBox() {
+            selectedFile = null;
+            if (fileInput) fileInput.value = '';
+            if (previewImage) {
+                previewImage.src = '';
+                previewImage.style.display = 'none';
+            }
+            if (uploadPrompt) uploadPrompt.style.display = '';
+            if (scanButton) {
+                scanButton.disabled = true;
+                scanButton.textContent = 'Extract Information';
+            }
+            if (scanStatus) scanStatus.innerHTML = '';
+            if (extractedFormCard) extractedFormCard.style.display = 'none';
+            if (dropZone) dropZone.scrollIntoView({ behavior: 'smooth' });
+        }
 
         function handleFile(file) {
             if (!file || !file.type || !file.type.match(/image\/(jpeg|png|webp)/)) {
@@ -35,6 +56,9 @@
             }
             if (scanStatus) {
                 scanStatus.textContent = '';
+            }
+            if (extractedFormCard) {
+                extractedFormCard.style.display = 'none';
             }
         }
 
@@ -62,6 +86,10 @@
             fileInput.addEventListener('change', () => {
                 if (fileInput.files.length) handleFile(fileInput.files[0]);
             });
+        }
+
+        if (scanAnotherBtn) {
+            scanAnotherBtn.addEventListener('click', resetScanBox);
         }
 
         if (scanButton) {
@@ -102,17 +130,26 @@
                     }
 
                     if (safeStatus) {
-                        safeStatus.innerHTML = '<span class="text-success">✓ Text extracted. Redirecting to the review form…</span>';
+                        safeStatus.innerHTML = '<span class="text-success">✓ Text extracted successfully.</span>';
+                    }
+
+                    // Populate the "extracted" card with what was detected, and point
+                    // "Continue to Review" at the right page for this document type —
+                    // but DO NOT auto-navigate. The person can review right here, scan
+                    // another document, or continue when ready.
+                    if (detectedTypeHeading) {
+                        detectedTypeHeading.textContent = `✅ Detected: ${data.document_label || 'Document'}`;
+                    }
+                    if (detectedTypeSub) {
+                        const conf = (typeof data.confidence !== 'undefined') ? `${data.confidence}%` : 'N/A';
+                        detectedTypeSub.textContent = `Confidence: ${conf}. Continue to review and complete the form, or scan another document below.`;
+                    }
+                    if (continueToReview && data.redirect) {
+                        continueToReview.href = data.redirect;
                     }
                     if (extractedFormCard) {
                         extractedFormCard.style.display = 'block';
                         extractedFormCard.scrollIntoView({ behavior: 'smooth' });
-                    }
-
-                    if (data.redirect) {
-                        setTimeout(() => {
-                            window.location.href = data.redirect;
-                        }, 600);
                     }
                 } catch (err) {
                     if (safeStatus) {

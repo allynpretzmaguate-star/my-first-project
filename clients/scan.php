@@ -108,7 +108,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['document'])) {
 }
 
 $pageTitle = 'Scan Document';
-$extraScripts = ['assets/js/scan.js?v=3'];
+$extraScripts = ['assets/js/scan.js?v=4'];
 include dirname(__DIR__) . '/includes/header.php';
 ?>
 <div class="card">
@@ -134,6 +134,9 @@ include dirname(__DIR__) . '/includes/header.php';
 <div class="card" id="extractedFormCard" style="display:none">
     <h3 id="detectedTypeHeading">✅ Information Extracted</h3>
     <p class="text-muted" id="detectedTypeSub">Continue to review and complete the form.</p>
-    <a href="<?= BASE_URL ?>clients/add.php" id="continueToReview" class="btn btn-primary">Continue to Review →</a>
+    <div style="display:flex; gap:10px; flex-wrap:wrap;">
+        <a href="<?= BASE_URL ?>clients/add.php" id="continueToReview" class="btn btn-primary">Continue to Review →</a>
+        <button type="button" id="scanAnotherBtn" class="btn btn-outline">📷 Scan Another Document</button>
+    </div>
 </div>
 <?php include dirname(__DIR__) . '/includes/footer.php'; ?>

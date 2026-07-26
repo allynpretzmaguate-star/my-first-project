@@ -1,11 +1,39 @@
 <?php
 /**
  * OcrEngine
- * Wraps the Tesseract OCR CLI binary and parses the raw extracted
- * text into structured client fields using layout-tolerant heuristics.
- * Also exposes per-field OCR confidence and "smart correction"
- * suggestions for common OCR misreads.
+ * Runs OCR by calling the persistent ocr_service.py Flask service
+ * (started separately with `py -3.13 python\ocr_service.py`) instead of
+ * spawning a fresh Python/PaddleOCR process on every scan. The service
+ * loads PaddleOCR's models once at startup, so requests here just do
+ * inference — this is what makes scans fast (seconds, not minutes).
+ *
+ * The service responds with the same JSON shape the old Tesseract-based
+ * extractTextAndConfidence() returned:
+ *   {"text": "...", "confidence": 92.4, "words": [{"text":"..","conf":92.4}, ...]}
+ * So DocumentClassifier / DocumentFieldExtractor / everything downstream
+ * needs no changes at all.
+ *
+ * IMPORTANT: ocr_service.py must be running in its own terminal window
+ * (py -3.13 C:\xampp\htdocs\ScannerEncoding\python\ocr_service.py)
+ * whenever you use the ScannerEncoding app. This class will throw a
+ * clear error if it can't reach the service.
  */
+
+// --- OCR service integration --------------------------------------------
+if (!defined('OCR_SERVICE_URL')) {
+    define('OCR_SERVICE_URL', 'http://127.0.0.1:5001/ocr');
+}
+if (!defined('OCR_SERVICE_HEALTH_URL')) {
+    define('OCR_SERVICE_HEALTH_URL', 'http://127.0.0.1:5001/health');
+}
+// Generous but finite timeout for a single scan request. Once the models
+// are warm, inference should take a few seconds; this just guards
+// against a hung request.
+if (!defined('OCR_SERVICE_TIMEOUT_SECONDS')) {
+    define('OCR_SERVICE_TIMEOUT_SECONDS', 300);
+}
+// --------------------------------------------------------------------------
+
 class OcrEngine
 {
     public static function extractText(string $imagePath): string
@@ -15,172 +43,101 @@ class OcrEngine
 
     public static function extractTextAndConfidence(string $imagePath): array
     {
-        if (!is_file(TESSERACT_PATH) && stripos(PHP_OS, 'WIN') === 0) {
-            throw new RuntimeException(
-                'Tesseract OCR was not found at ' . TESSERACT_PATH .
-                '. Install it from https://github.com/UB-Mannheim/tesseract/wiki and/or update config/config.php.'
-            );
+        if (!is_file($imagePath)) {
+            throw new RuntimeException('Image file not found: ' . $imagePath);
         }
 
-        $enhancedImage = self::enhanceImage($imagePath);
-        $useImage = $enhancedImage !== '' ? $enhancedImage : $imagePath;
-
-        $outputBase = tempnam(sys_get_temp_dir(), 'ocr_');
-        if ($outputBase === false) {
-            throw new RuntimeException('Could not create a temporary file for OCR output.');
-        }
-        @unlink($outputBase);
-
-        $tesseract = escapeshellarg(TESSERACT_PATH);
-        $image = escapeshellarg($useImage);
-        $out = escapeshellarg($outputBase);
-
-        $cmdText = "$tesseract $image $out --psm 6 -l eng 2>&1";
-        exec($cmdText, $textOutput, $textReturnCode);
-
-        $textFile = $outputBase . '.txt';
-        if ($textReturnCode !== 0 || !is_file($textFile)) {
-            if ($enhancedImage !== '' && is_file($enhancedImage)) {
-                @unlink($enhancedImage);
-            }
-            throw new RuntimeException('OCR failed: ' . implode("\n", $textOutput));
-        }
-
-        $text = file_get_contents($textFile);
-        @unlink($textFile);
-
-        $cmdTsv = "$tesseract $image $out tsv --psm 6 -l eng 2>&1";
-        exec($cmdTsv, $tsvOutput, $tsvReturnCode);
-        $tsvFile = $outputBase . '.tsv';
-        $confidence = null;
-        $words = [];
-        if ($tsvReturnCode === 0 && is_file($tsvFile)) {
-            $confidence = self::computeAverageConfidence($tsvFile);
-            $words = self::parseTsvWords($tsvFile);
-            @unlink($tsvFile);
-        }
-
-        if ($enhancedImage !== '' && is_file($enhancedImage)) {
-            @unlink($enhancedImage);
-        }
+        $result = self::callOcrService($imagePath);
 
         return [
-            'text' => $text !== false ? $text : '',
-            'confidence' => $confidence,
-            'words' => $words,
+            'text' => $result['text'] ?? '',
+            'confidence' => $result['confidence'] ?? null,
+            'words' => $result['words'] ?? [],
         ];
     }
 
-    private static function enhanceImage(string $sourcePath): string
+    /**
+     * Calls the persistent ocr_service.py Flask service over HTTP instead
+     * of spawning a new Python process. The service must already be
+     * running (see class docblock).
+     */
+    private static function callOcrService(string $imagePath): array
     {
-        if (!function_exists('imagecreatefromjpeg') || !function_exists('imagefilter')) {
-            return '';
+        // Resolve to an absolute path — the Python service runs as its own
+        // process with its own working directory, so a relative path from
+        // PHP's perspective won't necessarily resolve on the Python side.
+        $absolutePath = realpath($imagePath);
+        if ($absolutePath === false) {
+            throw new RuntimeException('Could not resolve absolute path for image: ' . $imagePath);
         }
 
-        $image = self::loadImageFromFile($sourcePath);
-        if ($image === null) {
-            return '';
+        $payload = json_encode(['image_path' => $absolutePath]);
+
+        $ch = curl_init(OCR_SERVICE_URL);
+        curl_setopt_array($ch, [
+            CURLOPT_POST => true,
+            CURLOPT_POSTFIELDS => $payload,
+            CURLOPT_HTTPHEADER => ['Content-Type: application/json'],
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT => OCR_SERVICE_TIMEOUT_SECONDS,
+            CURLOPT_CONNECTTIMEOUT => 3,
+        ]);
+
+        $response = curl_exec($ch);
+        $errorNo = curl_errno($ch);
+        $error = curl_error($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+
+        if ($errorNo === CURLE_COULDNT_CONNECT || $errorNo === CURLE_OPERATION_TIMEDOUT) {
+            throw new RuntimeException(
+                'Could not reach the OCR service at ' . OCR_SERVICE_URL . '. ' .
+                'Make sure ocr_service.py is running in its own terminal window ' .
+                '(py -3.13 python\\ocr_service.py) and shows ' .
+                '"PaddleOCR models loaded. Service ready on http://127.0.0.1:5001" ' .
+                'before you scan.'
+            );
         }
 
-        imagefilter($image, IMG_FILTER_GRAYSCALE);
-        imagefilter($image, IMG_FILTER_CONTRAST, -12);
-        imagefilter($image, IMG_FILTER_BRIGHTNESS, 5);
-        imagefilter($image, IMG_FILTER_SMOOTH, 1);
-
-        if (function_exists('imageconvolution')) {
-            imageconvolution($image, [
-                [-1, -1, -1],
-                [-1, 16, -1],
-                [-1, -1, -1],
-            ], 8, 0);
+        if ($errorNo !== 0) {
+            throw new RuntimeException('OCR service request failed: ' . $error);
         }
 
-        $tempPath = tempnam(sys_get_temp_dir(), 'ocr_img_');
-        if ($tempPath === false) {
-            imagedestroy($image);
-            return '';
+        $decoded = json_decode($response, true);
+
+        if (json_last_error() !== JSON_ERROR_NONE || !is_array($decoded)) {
+            throw new RuntimeException(
+                "OCR service returned invalid JSON (HTTP $httpCode):\n" . $response
+            );
         }
 
-        $tempPath .= '.png';
-        if (!imagepng($image, $tempPath)) {
-            imagedestroy($image);
-            @unlink($tempPath);
-            return '';
+        if ($httpCode !== 200 || isset($decoded['error'])) {
+            throw new RuntimeException(
+                'OCR service error (HTTP ' . $httpCode . '): ' . ($decoded['error'] ?? 'unknown error')
+            );
         }
 
-        imagedestroy($image);
-        return $tempPath;
+        return $decoded;
     }
 
-    private static function loadImageFromFile(string $path)
+    /**
+     * Optional helper: quick check that the OCR service is up before
+     * attempting a scan, so callers can show a friendly message instead
+     * of waiting for a timeout. Not required, but handy to call from
+     * clients/scan.php before running the OCR itself.
+     */
+    public static function isServiceRunning(): bool
     {
-        $info = @getimagesize($path);
-        if ($info === false) {
-            return null;
-        }
-
-        switch ($info[2]) {
-            case IMAGETYPE_JPEG:
-                return @imagecreatefromjpeg($path);
-            case IMAGETYPE_PNG:
-                return @imagecreatefrompng($path);
-            case IMAGETYPE_WEBP:
-                return @imagecreatefromwebp($path);
-            default:
-                return null;
-        }
-    }
-
-    private static function computeAverageConfidence(string $tsvFile): ?float
-    {
-        $lines = file($tsvFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
-        if ($lines === false || count($lines) <= 1) {
-            return null;
-        }
-
-        $total = 0.0;
-        $count = 0;
-        foreach (array_slice($lines, 1) as $line) {
-            $parts = explode("\t", $line);
-            if (!isset($parts[10])) {
-                continue;
-            }
-            $conf = trim($parts[10]);
-            if ($conf === '' || $conf === '-1' || !is_numeric($conf)) {
-                continue;
-            }
-            $total += (float)$conf;
-            $count++;
-        }
-
-        return $count > 0 ? round($total / $count, 2) : null;
-    }
-
-    private static function parseTsvWords(string $tsvFile): array
-    {
-        $lines = file($tsvFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
-        if ($lines === false || count($lines) <= 1) {
-            return [];
-        }
-
-        $words = [];
-        foreach (array_slice($lines, 1) as $line) {
-            $parts = explode("\t", $line);
-            if (count($parts) < 12) {
-                continue;
-            }
-            $level = $parts[0];
-            $conf = trim($parts[10]);
-            $text = trim($parts[11]);
-
-            if ($level !== '5' || $text === '' || $conf === '' || $conf === '-1' || !is_numeric($conf)) {
-                continue;
-            }
-
-            $words[] = ['text' => $text, 'conf' => (float)$conf];
-        }
-
-        return $words;
+        $ch = curl_init(OCR_SERVICE_HEALTH_URL);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT => 2,
+            CURLOPT_CONNECTTIMEOUT => 2,
+        ]);
+        $response = curl_exec($ch);
+        $ok = curl_errno($ch) === 0 && curl_getinfo($ch, CURLINFO_HTTP_CODE) === 200;
+        curl_close($ch);
+        return $ok && $response !== false;
     }
 
     public static function parseFields(string $rawText): array
@@ -345,9 +302,6 @@ class OcrEngine
 
     private static function suggestFieldCorrection(string $key, string $value): ?string
     {
-        // Expanded to also cover Business Card / Receipt / Invoice fields,
-        // so smart-correction suggestions aren't limited to the original
-        // ID-card-style fields.
         $letterFields = [
             'first_name', 'middle_name', 'last_name', 'region', 'province', 'city',
             'barangay', 'residence', 'street', 'birth_place', 'religion', 'ethnic_origin',
@@ -402,15 +356,6 @@ class OcrEngine
         return $suggested !== $value ? $suggested : null;
     }
 
-    /**
-     * Finds a labeled value where the value is either:
-     *   - on the same line after a colon/dash ("Label: value"), or
-     *   - on the next line entirely (common on ID cards, e.g.
-     *     "APELYIDO/LAST NAME" on one line, "DELA CRUZ" on the next).
-     * Label matching no longer requires the label to be at the start of
-     * the line, since cards often prefix it with a bilingual translation
-     * ("TIRAHAN/ADDRESS", "GITNANG APELYIDO/MIDDLE NAME", etc.).
-     */
     private static function findLabeledValue(array $lines, array $labelVariants): ?string
     {
         foreach ($lines as $i => $line) {
@@ -486,12 +431,6 @@ class OcrEngine
         }
     }
 
-    /**
-     * Detects date of birth. Checks the label line itself first
-     * ("Date of Birth: 10/04/1987"), then falls back to the *next* line,
-     * since many ID layouts (PhilSys National ID included) put the label
-     * on its own line and the date directly underneath it.
-     */
     private static function detectBirthDate(array $lines, string $fullText, array &$fields): void
     {
         foreach ($lines as $i => $line) {
@@ -504,9 +443,6 @@ class OcrEngine
                     $fields['birth_date'] = self::normalizeDate($m[1]);
                     return;
                 }
-                // Fall back to the next line — the value is often printed
-                // directly below the (possibly bilingual) label instead of
-                // beside it.
                 if (isset($lines[$i + 1])) {
                     $next = $lines[$i + 1];
                     if (preg_match('/\b(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})\b/', $next, $m)) {
@@ -545,13 +481,6 @@ class OcrEngine
         }
     }
 
-    /**
-     * Detects the address. The label may appear bilingually
-     * ("TIRAHAN/ADDRESS") rather than starting the line with "Address",
-     * so we now match "address" anywhere in the line instead of requiring
-     * it at the start. The value may be on the same line (after a colon
-     * or dash) or spill across the following line(s).
-     */
     private static function detectAddress(array $lines, array &$fields): void
     {
         foreach ($lines as $i => $line) {
@@ -584,15 +513,6 @@ class OcrEngine
         return (bool)preg_match('/^(name|address|sex|date of birth|birth\s*date|dob|id\s*(type|number)|control\s*no|digital\s*id)/i', trim($line));
     }
 
-    /**
-     * Looks for the ID number in priority order:
-     *   1. An explicit label like "ID Number", "PCN", "Control No.", or
-     *      "Digital ID Number" (PhilSys cards use this exact label for a
-     *      short alphanumeric code, e.g. "AYM6774").
-     *   2. The PhilSys PSN/PCN dashed format: 4 groups of 4 digits
-     *      (e.g. 5413-5073-8453-1285).
-     *   3. A looser fallback digit-grouping pattern.
-     */
     private static function detectIdNumber(string $fullText, array &$fields, array $lines = []): void
     {
         foreach ($lines as $i => $line) {
@@ -612,7 +532,6 @@ class OcrEngine
             $fields['id_number'] = trim(preg_replace('/\s+/', ' ', $m[2]));
             return;
         }
-        // PhilSys PSN / PCN format: 4 groups of 4 digits (e.g. 5413-5073-8453-1285)
         if (preg_match('/\b(\d{4}[\-\s]?\d{4}[\-\s]?\d{4}[\-\s]?\d{4})\b/', $fullText, $m)) {
             $fields['id_number'] = trim($m[1]);
             return;
